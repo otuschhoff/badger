@@ -134,10 +134,15 @@ func (w *WaterMark) process(closer *z.Closer) {
 
 	heap.Init(&indices)
 
+	var mapOpCount int // Counter to trigger periodic compaction
+	var heapOpCount int // Counter to trigger periodic compaction
+	const mapCompactTrigger = 10_000
+	const heapGCTrigger = 1_000_000 // Run GC every 1M ops if heap is large
+
 	processOne := func(index uint64, done bool) {
 		// If not already done, then set. Otherwise, don't undo a done entry.
 		prev, present := pending[index]
-		if !present {
+		if !present  {
 			heap.Push(&indices, index)
 		}
 
@@ -145,8 +150,88 @@ func (w *WaterMark) process(closer *z.Closer) {
 		if done {
 			delta = -1
 		}
-		pending[index] = prev + delta
+		//pending[index] = prev + delta
 
+		// FIX 1: Delete key if count is zero to prevent map growth
+		newVal := prev + delta
+		if newVal == 0 {
+			delete(pending, index)
+		} else {
+			pending[index] = newVal
+		}
+
+		mapOpCount++
+		heapOpCount++
+
+		// FIX 2: Map Compaction
+		// If map is small (< 1000 items) but we have processed many ops (> 10k),
+		// re-allocate to shrink the underlying bucket memory.
+		if len(pending) < 1000 && mapOpCount > mapCompactTrigger {
+			newPending := make(map[uint64]int, len(pending))
+			for k, v := range pending {
+				newPending[k] = v
+			}
+			pending = newPending
+			mapOpCount = 0
+		}
+
+		if len(indices) > 10_000_000 && heapOpCount > heapGCTrigger {
+			// Filter in-place: keep only indices that are still pending
+			n := 0
+			for _, idx := range indices {
+				if _, isActive := pending[idx]; isActive {
+					indices[n] = idx
+					n++
+				}
+			}
+			// Shrink the slice to the new length
+			indices = indices[:n]
+			
+			// Re-establish heap property (O(N), but acceptable occasionally)
+			heap.Init(&indices)
+			
+			// Optional: Release array memory if it shrank drastically
+			if cap(indices) > 3*len(indices) {
+				newIndices := make(uint64Heap, len(indices))
+				copy(newIndices, indices)
+				indices = newIndices
+			}
+			
+			heapOpCount = 0 // Reset counter
+		}
+
+		doneUntil := w.DoneUntil()
+		if doneUntil > index {
+			AssertTruef(false, "Name: %s doneUntil: %d. Index: %d", w.Name, doneUntil, index)
+		}
+
+		until := doneUntil
+		loops := 0
+
+		for len(indices) > 0 {
+			min := indices[0]
+			if val, ok := pending[min]; ok && val > 0 {
+				break // len(indices) will be > 0.
+			}
+			heap.Pop(&indices)
+			delete(pending, min)
+			until = min
+			loops++
+		}
+
+		// FIX 3: Heap Compaction
+		// If heap is empty or sparse, replace the slice to free array memory.
+		if len(indices) == 0 {
+			if cap(indices) > 1024 {
+				indices = make(uint64Heap, 0, 1024)
+			}
+		} else if cap(indices) > 4*len(indices) && cap(indices) > 1024 {
+			newIndices := make(uint64Heap, len(indices))
+			copy(newIndices, indices)
+			indices = newIndices
+		}
+
+		/* OLD code
 		// Update mark by going through all indices in order; and checking if they have
 		// been done. Stop at the first index, which isn't done.
 		doneUntil := w.DoneUntil()
@@ -169,6 +254,7 @@ func (w *WaterMark) process(closer *z.Closer) {
 			until = min
 			loops++
 		}
+		*/
 
 		if until != doneUntil {
 			AssertTrue(w.doneUntil.CompareAndSwap(doneUntil, until))
